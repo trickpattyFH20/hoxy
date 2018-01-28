@@ -15,6 +15,7 @@ import { SNISpoofer } from './sni-spoofer'
 import net from 'net'
 import https from 'https'
 import { ThrottleGroup } from 'stream-throttle'
+import WebSocket from 'ws'
 
 // TODO: test all five for both requet and response
 let asHandlers = {
@@ -244,7 +245,127 @@ export default class Proxy extends EventEmitter {
         })
         fromClient.pipe(toServer)
       })
+      var wssServer = new WebSocket.Server({ server: this._tlsSpoofingServer });
+      wssServer.on('connection', (ws, req) => {
+        ws.upgradeReq = req;
+        this.onWebSocketServerConnect(true, ws, req);
+      });
     }
+  }
+
+  onWebSocketServerConnect(isSSL, ws, upgradeReq) {
+    var self = this;
+    var ctx = {
+      isSSL: isSSL,
+      clientToProxyWebSocket: ws,
+    }
+    ctx.clientToProxyWebSocket.on('message', self.onWebSocketFrame.bind(self, ctx, 'message', false));
+    ctx.clientToProxyWebSocket.on('ping', self.onWebSocketFrame.bind(self, ctx, 'ping', false));
+    ctx.clientToProxyWebSocket.on('pong', self.onWebSocketFrame.bind(self, ctx, 'pong', false));
+    ctx.clientToProxyWebSocket.on('error', self.onWebSocketError.bind(self, ctx));
+    // ctx.clientToProxyWebSocket.on('close', self._onWebSocketClose.bind(self, ctx, false));
+    // ctx.clientToProxyWebSocket.pause();
+    var url;
+    if (upgradeReq.url == '' || /^\//.test(upgradeReq.url)) {
+      var hostPort = this.parseHostAndPort(upgradeReq);
+      url = (ctx.isSSL ? 'wss' : 'ws') + '://' + hostPort.host + (hostPort.port ? ':' + hostPort.port : '') + upgradeReq.url;
+    } else {
+      url = upgradeReq.url;
+    }
+    var ptosHeaders = {};
+    var ctopHeaders = upgradeReq.headers;
+    for (var key in ctopHeaders) {
+      if (key.indexOf('sec-websocket') !== 0) {
+        ptosHeaders[key] = ctopHeaders[key];
+      }
+    }
+    ctx.proxyToServerWebSocketOptions = {
+      url: url,
+      agent: ctx.isSSL ? self.httpsAgent : self.httpAgent,
+      headers: ptosHeaders
+    };
+    return makeProxyToServerWebSocket();
+
+    function makeProxyToServerWebSocket() {
+      // TODO garbage collect this websocket
+      ctx.proxyToServerWebSocket = new WebSocket(ctx.proxyToServerWebSocketOptions.url, ctx.proxyToServerWebSocketOptions);
+      ctx.proxyToServerWebSocket.on('message', self.onWebSocketFrame.bind(self, ctx, 'message', true));
+      ctx.proxyToServerWebSocket.on('ping', self.onWebSocketFrame.bind(self, ctx, 'ping', true));
+      ctx.proxyToServerWebSocket.on('pong', self.onWebSocketFrame.bind(self, ctx, 'pong', true));
+      ctx.proxyToServerWebSocket.on('error', self.onWebSocketError.bind(self, ctx));
+      // ctx.proxyToServerWebSocket.on('close', self._onWebSocketClose.bind(self, ctx, true));
+      // ctx.proxyToServerWebSocket.on('open', function() {
+      //   if (ctx.clientToProxyWebSocket.readyState === WebSocket.OPEN) {
+      //     ctx.clientToProxyWebSocket.resume();
+      //   }
+      // });
+    }
+  };
+
+  onWebSocketFrame(ctx, type, fromServer, data, flags) {
+    var self = this;
+    var destWebSocket = fromServer ? ctx.clientToProxyWebSocket : ctx.proxyToServerWebSocket;
+    if (destWebSocket.readyState === WebSocket.OPEN) {
+      switch(type) {
+        case 'message': destWebSocket.send(data, flags);
+        break;
+        case 'ping': destWebSocket.ping(data, flags, false);
+        break;
+        case 'pong': destWebSocket.pong(data, flags, false);
+        break;
+      }
+    } else {
+      self.onWebSocketError(ctx, new Error('Cannot send ' + type + ' because ' + (fromServer ? 'clientToProxy' : 'proxyToServer') + ' WebSocket connection state is not OPEN'));
+    }
+  };
+
+  onWebSocketError(ctx, err) {
+    if (ctx.proxyToServerWebSocket && ctx.clientToProxyWebSocket.readyState !== ctx.proxyToServerWebSocket.readyState) {
+      if (ctx.clientToProxyWebSocket.readyState === WebSocket.CLOSED && ctx.proxyToServerWebSocket.readyState === WebSocket.OPEN) {
+        ctx.proxyToServerWebSocket.close();
+      } else if (ctx.proxyToServerWebSocket.readyState === WebSocket.CLOSED && ctx.clientToProxyWebSocket.readyState === WebSocket.OPEN) {
+        ctx.clientToProxyWebSocket.close();
+      }
+    }
+  }
+
+  parseHostAndPort(req, defaultPort) {
+    var host = req.headers.host;
+    if (!host) {
+      return null;
+    }
+    var hostPort = this.parseHost(host, defaultPort);
+
+    // this handles paths which include the full url. This could happen if it's a proxy
+    var m = req.url.match(/^http:\/\/([^\/]*)\/?(.*)$/);
+    if (m) {
+      var parsedUrl = url.parse(req.url);
+      hostPort.host = parsedUrl.hostname;
+      hostPort.port = parsedUrl.port;
+      req.url = parsedUrl.path;
+    }
+
+    return hostPort;
+  }
+
+  parseHost(hostString, defaultPort) {
+    var m = hostString.match(/^http:\/\/(.*)/);
+    if (m) {
+      var parsedUrl = url.parse(hostString);
+      return {
+        host: parsedUrl.hostname,
+        port: parsedUrl.port
+      };
+    }
+
+    var hostPort = hostString.split(':');
+    var host = hostPort[0];
+    var port = hostPort.length === 2 ? +hostPort[1] : defaultPort;
+
+    return {
+      host: host,
+      port: port
+    };
   }
 
   listen(port) {
